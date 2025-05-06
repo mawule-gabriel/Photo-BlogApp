@@ -1,0 +1,549 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: SAM template for Photo Blog App backend with DR
+
+Parameters:
+  PrimaryRegion:
+    Type: String
+    Default: us-east-1
+  DRRegion:
+    Type: String
+    Default: us-west-2
+  AdminEmail:
+    Type: String
+    Default: admin@mawulephotoblog.link
+
+Globals:
+  Function:
+    Timeout: 30
+    Runtime: java21
+    MemorySize: 512
+    Environment:
+      Variables:
+        STAGING_BUCKET: !Ref StagingBucket
+        MAIN_BUCKET: !Ref MainBucket
+        BACKUP_BUCKET: !Ref BackupBucket
+        DYNAMODB_TABLE: !Ref PhotosTable
+        IMAGE_UPLOAD_QUEUE: !Ref ImageUploadQueue
+        IMAGE_RETRY_QUEUE: !Ref ImageRetryQueue
+        SES_DOMAIN: mawulephotoblog.link
+        DR_REGION: !Ref DRRegion
+        SNS_TOPIC: !Ref OutageAlertTopic
+
+Resources:
+  # Cognito User Pool
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: PhotoBlogUserPool
+      AutoVerifiedAttributes: [ email ]
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Required: true
+        - Name: given_name
+          AttributeDataType: String
+        - Name: family_name
+          AttributeDataType: String
+      LambdaConfig:
+        PostConfirmation: !GetAtt WelcomeEmailTrigger.Arn
+        PostAuthentication: !GetAtt LoginAlertTrigger.Arn
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: PhotoBlogAppClient
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+
+  # S3 Buckets
+  StagingBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: staging-photos-mawulephotoblog
+      VersioningConfiguration:
+        Status: Enabled
+      NotificationConfiguration:
+        QueueConfigurations:
+          - Event: s3:ObjectCreated:*
+            Queue: !GetAtt ImageUploadQueue.Arn
+
+  MainBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: photos-mawulephotoblog
+      VersioningConfiguration:
+        Status: Enabled
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders: [ '*' ]
+            AllowedMethods: [ GET ]
+            AllowedOrigins: [ 'https://mawulephotoblog.link' ]
+            MaxAge: 3000
+
+  MainBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref MainBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action: [ 's3:GetObject' ]
+            Resource: !Sub 'arn:aws:s3:::${MainBucket}/*'
+            Condition:
+              StringEquals:
+                'aws:Referer': 'https://mawulephotoblog.link'
+
+  BackupBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: backup-photos-mawulephotoblog
+      VersioningConfiguration:
+        Status: Enabled
+
+  S3ReplicationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: S3ReplicationPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:ReplicateObject
+                  - s3:ReplicateDelete
+                Resource: !Sub 'arn:aws:s3:::${MainBucket}/*'
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:PutObjectAcl
+                Resource: !Sub 'arn:aws:s3:::${BackupBucket}/*'
+
+  S3ReplicationConfiguration:
+    Type: AWS::S3::Bucket
+    DependsOn: [MainBucket, BackupBucket, S3ReplicationRole]
+    Properties:
+      BucketName: !Ref MainBucket
+      ReplicationConfiguration:
+        Role: !GetAtt S3ReplicationRole.Arn
+        Rules:
+          - Id: BackupRule
+            Status: Enabled
+            Priority: 1
+            DeleteMarkerReplication:
+              Status: Disabled
+            Destination:
+              Bucket: !Sub 'arn:aws:s3:::${BackupBucket}'
+            Filter:
+              Prefix: ''
+
+  # DynamoDB Table
+  PhotosTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: PhotosTable
+      AttributeDefinitions:
+        - AttributeName: userId
+          AttributeType: S
+        - AttributeName: imageId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: userId
+          KeyType: HASH
+        - AttributeName: imageId
+          KeyType: RANGE
+      BillingMode: PAY_PER_REQUEST
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+
+  PhotosGlobalTable:
+    Type: AWS::DynamoDB::GlobalTable
+    Properties:
+      TableName: PhotosTableGlobal
+      AttributeDefinitions:
+        - AttributeName: userId
+          AttributeType: S
+        - AttributeName: imageId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: userId
+          KeyType: HASH
+        - AttributeName: imageId
+          KeyType: RANGE
+      BillingMode: PAY_PER_REQUEST
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      Replicas:
+        - Region: !Ref PrimaryRegion
+        - Region: !Ref DRRegion
+
+  # SQS Queues
+  ImageUploadQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: image-upload-queue
+      VisibilityTimeout: 60
+
+  ImageRetryQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: image-retry-queue
+      VisibilityTimeout: 60
+      DelaySeconds: 300
+
+  # SES Configuration
+  SESDomainIdentity:
+    Type: AWS::SES::EmailIdentity
+    Properties:
+      EmailIdentity: mawulephotoblog.link
+
+  # SNS Topic for Outage Alerts
+  OutageAlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: OutageAlertTopic
+      Subscription:
+        - Endpoint: !Ref AdminEmail
+          Protocol: email
+
+  # API Gateway
+  ApiGateway:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: prod
+      Auth:
+        DefaultAuthorizer: CognitoAuthorizer
+        Authorizers:
+          CognitoAuthorizer:
+            UserPoolArn: !GetAtt UserPool.Arn
+      Cors:
+        AllowMethods: "'GET,POST,DELETE,OPTIONS'"
+        AllowHeaders: "'Content-Type,Authorization'"
+        AllowOrigin: "'https://mawulephotoblog.link'"
+
+  # CloudWatch Alarm for Outage Detection
+  Route53HealthCheck:
+    Type: AWS::Route53::HealthCheck
+    Properties:
+      HealthCheckConfig:
+        Type: HTTPS
+        ResourcePath: /health
+        FullyQualifiedDomainName: mawulephotoblog.link
+        Port: 443
+        RequestInterval: 30
+        FailureThreshold: 3
+        Regions: [!Ref PrimaryRegion]
+
+  OutageAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: FrontendOutageAlarm
+      AlarmDescription: Alert on frontend outage
+      Metrics:
+        - Id: health
+          MetricStat:
+            Metric:
+              Namespace: AWS/Route53
+              MetricName: HealthCheckStatus
+              Dimensions:
+                - Name: HealthCheckId
+                  Value: !Ref Route53HealthCheck
+            Period: 60
+            Stat: Average
+          ReturnData: true
+      ComparisonOperator: LessThanThreshold
+      Threshold: 1
+      EvaluationPeriods: 3
+      ActionsEnabled: true
+      AlarmActions:
+        - !Ref OutageAlertTopic
+
+  # Lambda Functions
+  SignupHandler:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: target/PhotoBlogAppMicroS-1.0-SNAPSHOT.jar
+      Handler: com.photoblog.auth.SignupHandler::handleRequest
+      Policies:
+        - AmazonCognitoPowerUser
+        - AmazonSESFullAccess
+      Events:
+        Api:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /signup
+            Method: POST
+
+  LoginHandler:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: target/PhotoBlogAppMicroS-1.0-SNAPSHOT.jar
+      Handler: com.photoblog.auth.LoginHandler::handleRequest
+      Policies:
+        - AmazonCognitoPowerUser
+      Events:
+        Api:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /login
+            Method: POST
+
+  WelcomeEmailTrigger:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: target/PhotoBlogAppMicroS-1.0-SNAPSHOT.jar
+      Handler: com.photoblog.auth.WelcomeEmailTrigger::handleRequest
+      Policies:
+        - AmazonSESFullAccess
+
+  LoginAlertTrigger:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: target/PhotoBlogAppMicroS-1.0-SNAPSHOT.jar
+      Handler: com.photoblog.auth.LoginAlertTrigger::handleRequest
+      Policies:
+        - AmazonSESFullAccess
+
+  ImageUploadHandler:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: target/PhotoBlogAppMicroS-1.0-SNAPSHOT.jar
+      Handler: com.photoblog.photos.ImageUploadHandler::handleRequest
+      Policies:
+        - S3WritePolicy:
+            BucketName: !Ref StagingBucket
+        - SQSPublishPolicy:
+            QueueName: !GetAtt ImageUploadQueue.QueueName
+      Events:
+        Api:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /upload
+            Method: POST
+
+  ImageProcessor:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: target/PhotoBlogAppMicroS-1.0-SNAPSHOT.jar
+      Handler: com.photoblog.processing.ImageProcessor::handleRequest
+      Policies:
+        - S3CrudPolicy:
+            Bucket` BucketName: !Ref StagingBucket
+        - S3CrudPolicy:
+            BucketName: !Ref MainBucket
+        - DynamoDBCrudPolicy:
+            TableName: !Ref PhotosTable
+        - AmazonSESFullAccess
+        - SQSPublishPolicy:
+            QueueName: !GetAtt ImageRetryQueue.QueueName
+      Events:
+        SQS:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt ImageUploadQueue.Arn
+            BatchSize: 1
+        RetrySQS:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt ImageRetryQueue.Arn
+            BatchSize: 1
+
+  ImageViewHandler:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: target/PhotoBlogAppMicroS-1.0-SNAPSHOT.jar
+      Handler: com.photoblog.photos.ImageViewHandler::handleRequest
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref PhotosTable
+        - S3ReadPolicy:
+            BucketName: !Ref MainBucket
+      Events:
+        Api:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /images
+            Method: GET
+
+  ShareLinkHandler:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: target/PhotoBlogAppMicroS-1.0-SNAPSHOT.jar
+      Handler: com.photoblog.photos.ShareLinkHandler::handleRequest
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref PhotosTable
+        - S3ReadPolicy:
+            BucketName: !Ref MainBucket
+      Events:
+        Api:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /images/{imageId}/share
+            Method: GET
+
+  DeleteHandler:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: target/PhotoBlogAppMicroS-1.0-SNAPSHOT.jar
+      Handler: com.photoblog.photos.DeleteHandler::handleRequest
+      Policies:
+        - S3CrudPolicy:
+            BucketName: !Ref MainBucket
+        - DynamoDBCrudPolicy:
+            TableName: !Ref PhotosTable
+      Events:
+        Api:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /images/{imageId}
+            Method: DELETE
+
+  RecycleViewHandler:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: target/PhotoBlogAppMicroS-1.0-SNAPSHOT.jar
+      Handler: com.photoblog.photos.RecycleViewHandler::handleRequest
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref PhotosTable
+        - S3ReadPolicy:
+            BucketName: !Ref MainBucket
+      Events:
+        Api:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /recycle-bin
+            Method: GET
+
+  RestoreHandler:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: target/PhotoBlogAppMicroS-1.0-SNAPSHOT.jar
+      Handler: com.photoblog.photos.RestoreHandler::handleRequest
+      Policies:
+        - S3CrudPolicy:
+            BucketName: !Ref MainBucket
+        - DynamoDBCrudPolicy:
+            TableName: !Ref PhotosTable
+      Events:
+        Api:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /recycle-bin/{imageId}/restore
+            Method: POST
+
+  CognitoBackupHandler:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: target/PhotoBlogAppMicroS-1.0-SNAPSHOT.jar
+      Handler: com.photoblog.disaster.CognitoBackupHandler::handleRequest
+      Policies:
+        - AmazonCognitoPowerUser
+        - DynamoDBCrudPolicy:
+            TableName: !Ref PhotosTable
+      Events:
+        Schedule:
+          Type: Schedule
+          Properties:
+            Schedule: rate(1 day)
+
+  CognitoRestoreHandler:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: target/PhotoBlogAppMicroS-1.0-SNAPSHOT.jar
+      Handler: com.photoblog.disaster.CognitoRestoreHandler::handleRequest
+      Policies:
+        - AmazonCognitoPowerUser
+        - DynamoDBReadPolicy:
+            TableName: !Ref PhotosTable
+
+  OutageAlertHandler:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: target/PhotoBlogAppMicroS-1.0-SNAPSHOT.jar
+      Handler: com.photoblog.disaster.OutageAlertHandler::handleRequest
+      Policies:
+        - AmazonSNSFullAccess
+      Events:
+        SNS:
+          Type: SNS
+          Properties:
+            Topic: !Ref OutageAlertTopic
+
+  S3BackupMonitor:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: target/PhotoBlogAppMicroS-1.0-SNAPSHOT.jar
+      Handler: com.photoblog.disaster.S3BackupMonitor::handleRequest
+      Policies:
+        - S3ReadPolicy:
+            BucketName: !Ref BackupBucket
+      Events:
+        Schedule:
+          Type: Schedule
+          Properties:
+            Schedule: rate(1 hour)
+
+  DynamoDBBackupMonitor:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: target/PhotoBlogAppMicroS-1.0-SNAPSHOT.jar
+      Handler: com.photoblog.disaster.DynamoDBBackupMonitor::handleRequest
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref PhotosTable
+      Events:
+        Schedule:
+          Type: Schedule
+          Properties:
+            Schedule: rate(1 hour)
+
+Outputs:
+  ApiUrl:
+    Description: API Gateway endpoint URL
+    Value: !Sub 'https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/prod'
+  UserPoolId:
+    Description: Cognito User Pool ID
+    Value: !Ref UserPool
+  UserPoolClientId:
+    Description: Cognito User Pool Client ID
+    Value: !Ref UserPoolClient
+  StagingBucketName:
+    Description: Staging S3 Bucket Name
+    Value: !Ref StagingBucket
+  MainBucketName:
+    Description: Main S3 Bucket Name
+    Value: !Ref MainBucket
+  BackupBucketName:
+    Description: Backup S3 Bucket Name
+    Value: !Ref BackupBucket
+  PhotosTableName:
+    Description: DynamoDB Table Name
+    Value: !Ref PhotosTable
+  OutageAlertTopicArn:
+    Description: SNS Topic ARN for Outage Alerts
+    Value: !Ref OutageAlertTopic
